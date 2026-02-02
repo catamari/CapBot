@@ -1,16 +1,21 @@
 import json
-import requests
 import logging
+import os
+import requests
 import sqlite3
 import time
+import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from requests import HTTPError
 from typing import Tuple
 from urllib.parse import quote
 
+import discord
 from discord import app_commands
 from discord.ext import tasks
+
+from db import init_db, get_db
 
 """
 Main scheduled job:
@@ -39,13 +44,18 @@ Stretch
 - /set-user-not-capped
 """
 
+LOG_NAME = "CapBot"
 CLAN_NAME = "Vought"
 MAX_FAILURES = 5
 
-def get_date_timestamp(date:str):
+def get_date_timestamp(date:str) -> float:
     dt = datetime.strptime(date, "%d-%b-%Y %H:%M")
     dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+def timestamp_to_date(timestamp) -> str:
+    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return dt.strftime("%d-%b-%Y %H:%M")
 
 @dataclass
 class ClanMember:
@@ -82,7 +92,7 @@ class Activity:
     text:str
 
 def fetch_user_activites(rsn:str, num_activities:int=20) -> list[Activity]:
-    log = logging.getLogger("CapBot")
+    log = logging.getLogger(LOG_NAME)
 
     encoded_rsn = quote(rsn)
     url = f"https://apps.runescape.com/runemetrics/profile/profile?user={encoded_rsn}&activities={num_activities}"
@@ -118,7 +128,7 @@ def get_cap_events(activities:list[Activity]) -> list[Activity]:
             cap_events.append(activity)
     return cap_events
 
-def get_clan_cap_events(clan_name:str, max_events:int=-1):
+def get_clan_cap_events(clan_name:str, cancel_event:threading.Event, max_events:int=-1):
     log = logging.getLogger("CapBot")
     try:
         log.info(f"Fetching clan members for {clan_name}")
@@ -134,6 +144,9 @@ def get_clan_cap_events(clan_name:str, max_events:int=-1):
     index = 0
     user_cap_events:list[Tuple[str, int]] = [] # [(rsn,timestamp)]
     while index < len(clan_members):
+        if cancel_event.is_set():
+            return user_cap_events
+        
         member = clan_members[index]
         #elapsed_time = time.time() - start_time
         total_requests = num_failures + num_success
@@ -180,8 +193,23 @@ def get_clan_cap_events(clan_name:str, max_events:int=-1):
     
     return user_cap_events
 
+def fetch_cap_event_task(cancel_event:threading.Event):
+    log = logging.getLogger(LOG_NAME)
+    start_time = time.time()
+    log.debug("Starting fetch_cap_event_task...")
+
+    cap_events = get_clan_cap_events(CLAN_NAME, cancel_event)
+
+    insert_rows = [(event[0], event[1], "auto") for event in cap_events]
+    log.debug(f"Attempting to insert rows: {insert_rows}")
+    with get_db() as dbcon:
+        cur = dbcon.executemany("INSERT OR IGNORE INTO cap_events(rsn, cap_timestamp, source) VALUES(?,?,?)", insert_rows)
+        log.debug(f"Inserted {cur.rowcount} new rows.")
+
+    log.debug(f"fetch_cap_event_task completed after {time.time() - start_time} seconds.")
+
 def init_log():
-    log = logging.getLogger("CapBot")
+    log = logging.getLogger(LOG_NAME)
     log.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s")
 
@@ -192,39 +220,98 @@ def init_log():
     file_handler = logging.FileHandler("capbot.log", "w")
     file_handler.setFormatter(formatter)
     log.addHandler(file_handler)
+
+    log.info("CapBot log opened.")
     return log
 
-def init_db():
-    con = sqlite3.connect("capdata.db")
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cap_events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rsn TEXT NOT NULL,
-            cap_timestamp INTEGER NOT NULL,
-            source TEXT,
-            manual_user TEXT,
-            
-            UNIQUE(rsn, cap_timestamp)
-        )
-    """)
-    return con
+init_log()
+init_db()
 
-def main():
-    log = init_log()
-    dbcon = init_db()
+class DiscordClient(discord.Client):
+    def __init__(self, intents:discord.Intents):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.logger = logging.getLogger(LOG_NAME)
+        self.guild_id = discord.Object(id=os.getenv("GUILD_ID"))
+        self.task_thread = None
+        self.task_cancel_event = threading.Event()
 
-    # We may not be able to ignore events < last timestamp as it depends on when their alog was updated
-    #last_timestamp = dbcon.execute("SELECT cap_timestamp FROM cap_events ORDER BY cap_timestamp DESC LIMIT 1").fetchone()
+    async def setup_hook(self):
+        self.tree.copy_global_to(guild=self.guild_id)
+        await self.tree.sync(guild=self.guild_id)
 
-    cap_events = get_clan_cap_events(CLAN_NAME, max_events=10)
-    insert_rows = [(event[0], event[1], "auto") for event in cap_events]
-    log.debug(f"Attempting to insert rows: {insert_rows}")
-    with dbcon:
-        cur = dbcon.executemany("INSERT OR IGNORE INTO cap_events(rsn, cap_timestamp, source) VALUES(?,?,?)", insert_rows)
-        log.debug(f"Inserted {cur.rowcount} new rows.")
+    async def on_ready(self):
+        self.logger.info("ready")
+        print(f'Logged on as {self.user}!')
+        self.update_database_task.start()
 
-    dbcon.close()
+    async def close(self):
+        self.logger.debug("Waiting for fetch_cap_event_task thread to exit...")
+        if self.task_thread and self.task_thread.is_alive():
+            self.task_cancel_event.set()
+            self.task_thread.join(timeout=30)
+            if self.task_thread.is_alive():
+                self.logger.error("Timed out waiting for fetch_cap_event_task thread to join.")
+        super().close()
+
+    @tasks.loop(minutes=15)
+    async def update_database_task(self):
+        if self.task_thread and self.task_thread.is_alive():
+            self.logger.error("fetch_cap_event_task thread is still alive. Skipping update")
+            return
+
+        self.logger.debug("Starting fetch_cap_event_task thread")
+        self.task_thread = threading.Thread(target=fetch_cap_event_task, args=(self.task_cancel_event,))
+        self.task_thread.start()
+
+    @update_database_task.before_loop
+    async def before_update_database_task(self):
+        self.logger.debug("Waiting until ready to start update_database_task")
+        await self.wait_until_ready()
+        self.logger.debug("Ready")
+
+intents = discord.Intents.default()
+discord_client = DiscordClient(intents)
+
+@discord_client.tree.command(name="test", description="Test command")
+async def test_command(interaction:discord.Interaction):
+    await interaction.response.send_message("Hello")
+
+@discord_client.tree.command(name="caplist", description="Get the list of users that have capped in the last N days.")
+async def caplist(interaction:discord.Interaction, days:int=7):
+    now = datetime.now(timezone.utc)
+    start_date = now - timedelta(days=days)
+    timestamp = int(start_date.timestamp()) # Truncate as we only care about seconds
+    with get_db() as db:
+        con = db.execute(f"SELECT rsn,cap_timestamp FROM cap_events WHERE cap_timestamp >= {timestamp}")
+        results = con.fetchall()
+        rows = [(row[0], row[1]) for row in results]
+        rows.sort(key=lambda pair: pair[1], reverse=True) # sort by date
+
+        # Find longest username
+        longest_name = 0
+        longest_date = 0
+        for rsn, timestamp in rows:
+            longest_name = max(longest_name, len(rsn))
+            longest_date = max(longest_date, len(timestamp_to_date(timestamp)))
+
+        column_headers = ["RSN", "Cap Date"]
+        vertical_bars = len(column_headers) + 1
+        padding = len(column_headers) * 2
+        table_width = longest_name + longest_date + vertical_bars + padding
+
+        message = f"### Users that have capped in the last {days} days:\n"
+        message += "```\n" + ('-' * table_width) + "\n"
+
+        for rsn, timestamp in results:
+            date = timestamp_to_date(timestamp)
+            message += f"| {rsn:<{longest_name}} | {date:<{longest_date}} |\n"
+        message += ('-' * table_width) + "```"
+    await interaction.response.send_message(message, ephemeral=True)
+
+def run_bot():
+    token = os.getenv("BOT_TOKEN")
+    discord_client.run(token=token)
 
 if __name__ == "__main__":
-    main()
+    run_bot()
