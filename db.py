@@ -18,7 +18,7 @@ def init_db():
         """)
 
         # Index for primary query we do in /caplist
-        cur.execute("CREATE INDEX idx_cap_query ON cap_events(rsn,cap_timestamp)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cap_query ON cap_events(rsn,cap_timestamp)")
 
         # TODO: support adding missing columns.
         cur.execute("""
