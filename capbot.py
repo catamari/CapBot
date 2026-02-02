@@ -1,13 +1,9 @@
-import json
 import logging
 import os
-import requests
-import sqlite3
 import time
 import threading
 from datetime import datetime, timezone, timedelta
 from requests import HTTPError
-from typing import Tuple
 
 import discord
 from discord import app_commands
@@ -17,26 +13,34 @@ from db import init_db, get_db
 from rsapi import *
 
 LOG_NAME = "CapBot"
-CLAN_NAME = "Vought"
+CLAN_NAME = "Unknown"
 MAX_FAILURES = 5
 MAX_USER_QUERIES = 20
 UPDATE_LOOP_MINUTES = 1
 
 def get_date_timestamp(date:str) -> float:
+    """ Parses the date from a date string (RS Alog format) and returns it as a timestamp. """
     dt = datetime.strptime(date, "%d-%b-%Y %H:%M")
     dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
 
 def timestamp_to_date(timestamp) -> str:
+    """ Converts a timestamp into a date string (RS Alog format). """
     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     return dt.strftime("%d-%b-%Y %H:%M")
 
 def get_offset_from_now_timestamp(delta:timedelta) -> int:
+    """ Returns a timestamp of the current time (UTC) minus the provided delta. """
     now = datetime.now(timezone.utc)
     start_date = now - delta
     return int(start_date.timestamp()) # Truncate as we only care about seconds
 
 def get_user_activities(users:list[str], cancel_event:threading.Event, num_activities:int=20) -> dict[str, ActivityLog]:
+    """
+    Fetches the adventure's log for each user in the list.
+    Handles Jamflex's extreme rate limiting.
+    Returns a dict of rsn -> ActivityLog.
+    """
     log = logging.getLogger("CapBot")
     log.debug(f"Fetching last {num_activities} activities for {len(users)} users.")
 
@@ -50,7 +54,7 @@ def get_user_activities(users:list[str], cancel_event:threading.Event, num_activ
         
         rsn = users[index]
         try:
-            time.sleep(1)
+            time.sleep(1) # delay between each request to reduce 429 errors
 
             log.debug(f"Fetching alog for {rsn}")
             activities = fetch_user_activites(rsn, num_activities)
@@ -88,6 +92,15 @@ def get_user_activities(users:list[str], cancel_event:threading.Event, num_activ
     return activity_dict
 
 def update_task(cancel_event:threading.Event):
+    """
+    Background task to update the activity database for all the clan members.
+
+    To avoid having a very large delay between someone capping and the bot detecting it, we have to do a fair amount of work due to the API limits.
+    The API only allows roughly 15-20 requests/minute and is very aggressive with 'Too many request' errors which force you to wait an additional 10-30 seconds.
+    To deal with this we only query 20 users each update and run the update more often.
+    We also only query users who have recent (1 week) activity to bias more active players, but we force an update for a player if we haven't checked in over a day.
+    If a users's alog is private we also only check once a day.
+    """
     log = logging.getLogger(LOG_NAME)
     start_time = time.time()
     log.debug("Starting update_task...")
@@ -199,15 +212,17 @@ class DiscordClient(discord.Client):
         self.task_cancel_event = threading.Event()
 
     async def setup_hook(self):
+        # Copy our slash commands to the discord server we're running in.
         self.tree.copy_global_to(guild=self.guild_id)
         await self.tree.sync(guild=self.guild_id)
 
     async def on_ready(self):
-        self.logger.info("ready")
         self.logger.debug(f'Logged on as {self.user}!')
+        # Kick off the update task. We could do this earlier but this way we don't have to wait on it if login fails.
         self.update_database_task.start()
 
     async def close(self):
+        # Kill the update thread before shutting down.
         self.logger.debug("Waiting for update_task thread to exit...")
         if self.task_thread and self.task_thread.is_alive():
             self.task_cancel_event.set()
@@ -218,6 +233,7 @@ class DiscordClient(discord.Client):
 
     @tasks.loop(minutes=UPDATE_LOOP_MINUTES)
     async def update_database_task(self):
+        """ Scheduled looping update to run the background update. """
         if self.task_thread and self.task_thread.is_alive():
             self.logger.error("update_task thread is still alive. Skipping update")
             return
@@ -225,15 +241,10 @@ class DiscordClient(discord.Client):
         self.logger.debug("Starting update_task thread")
         self.task_thread = threading.Thread(target=update_task, args=(self.task_cancel_event,))
         self.task_thread.start()
-    
 
 
 intents = discord.Intents.default()
 discord_client = DiscordClient(intents)
-
-@discord_client.tree.command(name="test", description="Test command")
-async def test_command(interaction:discord.Interaction):
-    await interaction.response.send_message("Hello")
 
 @discord_client.tree.command(name="caplist", description="Get the list of users that have capped in the last N days.")
 async def caplist(interaction:discord.Interaction, days:int=7):

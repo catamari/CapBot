@@ -17,6 +17,7 @@ def init_db():
             )
         """)
 
+        # TODO: support adding missing columns.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_activity(
                 rsn TEXT PRIMARY KEY,

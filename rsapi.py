@@ -1,4 +1,3 @@
-import logging
 import requests
 from dataclasses import dataclass
 from urllib.parse import quote
