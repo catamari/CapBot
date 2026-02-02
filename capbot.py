@@ -16,36 +16,11 @@ from discord.ext import tasks
 from db import init_db, get_db
 from rsapi import *
 
-"""
-Main scheduled job:
-- Run on some interval (eg. 15 mins)
-- Fetch list of all clan members (cache)
-- Fetch https://apps.runescape.com/runemetrics/profile/profile?user=Philly+PD&activities=20 per user
-- Look for json['activities'][n]['text'] == "Capped at my Clan Citadel."
-- Create a list of all users that capped and include the event date
-- Query db to get a list of all users who already capped this week
-- Filter out any new users if they've already capped
-- Insert newly capped users into sqlite db with (rsn,date,automatic)
-
-Name changes?
-- If someone caps then changes their name their old name would appear in the list still. Admin has to map that to new name.
-
-Build tick:
-- time isn't consistent. Depends when first person enters, and shifts at least a few minutes each week
-
-Commands:
-- /caplist <days=7>
-    - list the users who capped in the last n days and the date the capped
-
-Stretch
-- /set-user-capped <rsn> <cap-date (default=now)>
-    - INSERT (rsn,date,manual,admin who ran command)
-- /set-user-not-capped
-"""
-
 LOG_NAME = "CapBot"
 CLAN_NAME = "Vought"
 MAX_FAILURES = 5
+MAX_USER_QUERIES = 20
+UPDATE_LOOP_MINUTES = 1
 
 def get_date_timestamp(date:str) -> float:
     dt = datetime.strptime(date, "%d-%b-%Y %H:%M")
@@ -112,19 +87,10 @@ def get_user_activities(users:list[str], cancel_event:threading.Event, num_activ
     
     return activity_dict
 
-def fetch_cap_event_task(cancel_event:threading.Event):
+def update_task(cancel_event:threading.Event):
     log = logging.getLogger(LOG_NAME)
     start_time = time.time()
-    log.debug("Starting fetch_cap_event_task...")
-
-    """
-    - only query a user's activity if their last activity was within 1 day OR we haven't queried them in > 1 day.
-    1. fetch all clan members from API
-    2. INSERT OR IGNORE all users into user_activity with 0,0 set for timestamps. This adds any missing members.
-    3. SELECT rsn from user_activity WHERE last_activity_timestamp < {now-1 day} OR last_query_timestamp > {now - 1day}
-    4. query activity data for these users.
-    5. UPDATE user_activity SET last_activity_timestamp={timestamp}, last_query_timestamp={now} WHERE ?
-    """
+    log.debug("Starting update_task...")
 
     # Fetch all clan members from rs api so we always have up to date list.
     try:
@@ -140,10 +106,17 @@ def fetch_cap_event_task(cancel_event:threading.Event):
         cur = dbcon.executemany("INSERT OR IGNORE INTO user_activity(rsn, last_activity_timestamp, last_query_timestamp) VALUES(?,?,?)", rows)
         log.debug(f"Added {cur.rowcount} new users into the user_activity table.")
 
-        # Get all users that have been active or we haven't checked recently.
-        recent_activity_timestamp = get_offset_from_now_timestamp(timedelta(hours=2))
+        # Get all users that have been active in the last week, or we haven't checked recently. Prioritize stale queries to ensure active users don't hog the queue.
+        recently_checked_timestamp = get_offset_from_now_timestamp(timedelta(minutes=5)) 
+        recent_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=7))
         stale_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=1))
-        cur = dbcon.execute(f"SELECT rsn FROM user_activity WHERE last_activity_timestamp >= {recent_activity_timestamp} OR last_query_timestamp < {stale_activity_timestamp}")
+        cur = dbcon.execute(f"""
+            SELECT rsn 
+            FROM user_activity 
+            WHERE 
+                (private = 0 AND last_activity_timestamp < {recent_activity_timestamp} AND last_query_timestamp < {recently_checked_timestamp})
+                OR last_query_timestamp < {stale_activity_timestamp} 
+            ORDER BY last_query_timestamp ASC""")
         users_to_query = [row[0] for row in cur.fetchall()]
 
     if len(users_to_query) == 0:
@@ -156,7 +129,7 @@ def fetch_cap_event_task(cancel_event:threading.Event):
 
     # Only query a few at a time as it's very slow due to Jagex rate limits
     log.debug(f"{len(users_to_query)} total users to query.")
-    users_to_query = users_to_query[:15]
+    users_to_query = users_to_query[:MAX_USER_QUERIES]
 
     # Query the user alogs. 
     user_activities:dict[str, ActivityLog] = get_user_activities(users_to_query, cancel_event)
@@ -190,12 +163,12 @@ def fetch_cap_event_task(cancel_event:threading.Event):
         cur = dbcon.executemany("UPDATE user_activity SET last_activity_timestamp = ?, last_query_timestamp = ?, private = 0 WHERE rsn = ?", user_activity_rows)
         log.debug(f"Updated last_activity_timestamp for {cur.rowcount} rows in user_activity. Rows = {user_activity_rows}")
 
-        # Update query time for users we queried but got no activity data from.
+        # Update query time for users we queried but got no activity data from. This may be due to private alogs.
         no_activity_rows = [(now, (1 if rsn in private_profiles else 0), rsn) for rsn in users_to_query if rsn not in user_activities or len(user_activities[rsn].activities) == 0]
         cur = dbcon.executemany("UPDATE user_activity SET last_query_timestamp = ?, private = ? WHERE rsn = ?", no_activity_rows)
         log.debug(f"Updated last_query_timestamp for {cur.rowcount} in-active users in user_activity. Rows = {no_activity_rows}")
 
-    log.debug(f"fetch_cap_event_task completed after {time.time() - start_time} seconds.")
+    log.debug(f"update_task completed after {time.time() - start_time} seconds.")
 
 def init_log():
     log = logging.getLogger(LOG_NAME)
@@ -231,26 +204,26 @@ class DiscordClient(discord.Client):
 
     async def on_ready(self):
         self.logger.info("ready")
-        print(f'Logged on as {self.user}!')
+        self.logger.debug(f'Logged on as {self.user}!')
         self.update_database_task.start()
 
     async def close(self):
-        self.logger.debug("Waiting for fetch_cap_event_task thread to exit...")
+        self.logger.debug("Waiting for update_task thread to exit...")
         if self.task_thread and self.task_thread.is_alive():
             self.task_cancel_event.set()
             self.task_thread.join(timeout=30)
             if self.task_thread.is_alive():
-                self.logger.error("Timed out waiting for fetch_cap_event_task thread to join.")
+                self.logger.error("Timed out waiting for update_task thread to join.")
         super().close()
 
-    @tasks.loop(minutes=1)
+    @tasks.loop(minutes=UPDATE_LOOP_MINUTES)
     async def update_database_task(self):
         if self.task_thread and self.task_thread.is_alive():
-            self.logger.error("fetch_cap_event_task thread is still alive. Skipping update")
+            self.logger.error("update_task thread is still alive. Skipping update")
             return
 
-        self.logger.debug("Starting fetch_cap_event_task thread")
-        self.task_thread = threading.Thread(target=fetch_cap_event_task, args=(self.task_cancel_event,))
+        self.logger.debug("Starting update_task thread")
+        self.task_thread = threading.Thread(target=update_task, args=(self.task_cancel_event,))
         self.task_thread.start()
     
 
@@ -269,28 +242,30 @@ async def caplist(interaction:discord.Interaction, days:int=7):
     timestamp = int(start_date.timestamp()) # Truncate as we only care about seconds
     with get_db() as db:
         con = db.execute(f"SELECT rsn,cap_timestamp FROM cap_events WHERE cap_timestamp >= {timestamp}")
-        results = con.fetchall()
-        rows = [(row[0], row[1]) for row in results]
+        rows = [(row[0], row[1]) for row in con.fetchall()]
         rows.sort(key=lambda pair: pair[1], reverse=True) # sort by date
 
-        # Find longest username
+        # Find longest strings in each column so we can pad out the rest to match.
         longest_name = 0
         longest_date = 0
         for rsn, timestamp in rows:
             longest_name = max(longest_name, len(rsn))
             longest_date = max(longest_date, len(timestamp_to_date(timestamp)))
 
+        # Compute table size
         column_headers = ["RSN", "Cap Date"]
         vertical_bars = len(column_headers) + 1
         padding = len(column_headers) * 2
         table_width = longest_name + longest_date + vertical_bars + padding
 
         message = f"### Users that have capped in the last {days} days:\n"
-        message += "```\n" + ('-' * table_width) + "\n"
+        message += "```\n" + ('-' * table_width) + "\n" # start code block + first horizontal bar
 
-        for rsn, timestamp in results:
+        # Add table rows
+        for rsn, timestamp in rows:
             date = timestamp_to_date(timestamp)
             message += f"| {rsn:<{longest_name}} | {date:<{longest_date}} |\n"
+        # Bottom vrtical bar + close code block
         message += ('-' * table_width) + "```"
     await interaction.response.send_message(message, ephemeral=True)
 
@@ -301,6 +276,8 @@ async def list_private_alogs(interaction:discord.Interaction):
         results = cur.fetchall()
         rsns = [f"- {row[0]}" for row in results]
         message = "### Users with private Alogs:\n" + "\n".join(rsns)
+        if len(rsns) == 0:
+            message += "None"
         await interaction.response.send_message(message, ephemeral=True)
 
 def run_bot():
