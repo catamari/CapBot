@@ -120,7 +120,7 @@ def update_task(cancel_event:threading.Event):
         log.debug(f"Added {cur.rowcount} new users into the user_activity table.")
 
         # Get all users that have been active in the last week, or we haven't checked recently. Prioritize stale queries to ensure active users don't hog the queue.
-        recently_checked_timestamp = get_offset_from_now_timestamp(timedelta(minutes=5)) 
+        recently_checked_timestamp = get_offset_from_now_timestamp(timedelta(minutes=10)) 
         recent_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=7))
         stale_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=1))
         cur = dbcon.execute(f"""
@@ -165,7 +165,6 @@ def update_task(cancel_event:threading.Event):
     with get_db() as dbcon:
         # Add new cap events
         insert_rows = [(event["rsn"], event["cap_timestamp"], "auto") for event in cap_events]
-        log.debug(f"Attempting to insert rows: {insert_rows}")
         cur = dbcon.executemany("INSERT OR IGNORE INTO cap_events(rsn, cap_timestamp, source) VALUES(?,?,?)", insert_rows)
         log.debug(f"Inserted {cur.rowcount} new rows into cap_events. Rows = {insert_rows}")
 
