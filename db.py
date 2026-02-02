@@ -18,10 +18,11 @@ def init_db():
         """)
 
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS last_user_activity(
+            CREATE TABLE IF NOT EXISTS user_activity(
                 rsn TEXT PRIMARY KEY,
                 last_activity_timestamp INTEGER NOT NULL,
-                last_query_timestamp INTEGER NOT NULL
+                last_query_timestamp INTEGER NOT NULL,
+                private TINYINT DEFAULT 0
             )
         """)
     con.close()

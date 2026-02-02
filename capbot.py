@@ -56,44 +56,37 @@ def timestamp_to_date(timestamp) -> str:
     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     return dt.strftime("%d-%b-%Y %H:%M")
 
-# TODO: cache data and prefer fetching data for users with recent activity.
-def get_clan_cap_events(clan_name:str, cancel_event:threading.Event, max_events:int=-1):
+def get_offset_from_now_timestamp(delta:timedelta) -> int:
+    now = datetime.now(timezone.utc)
+    start_date = now - delta
+    return int(start_date.timestamp()) # Truncate as we only care about seconds
+
+def get_user_activities(users:list[str], cancel_event:threading.Event, num_activities:int=20) -> dict[str, ActivityLog]:
     log = logging.getLogger("CapBot")
-    try:
-        log.info(f"Fetching clan members for {clan_name}")
-        clan_members:list[ClanMember] = fetch_clan_members(clan_name)
-    except Exception as ex:
-        log.exception(f"Failed to fetch clan members for {clan_name}: {ex}")
-        return {}
+    log.debug(f"Fetching last {num_activities} activities for {len(users)} users.")
 
     request_delay = 10
-    num_success = 0
     num_failures = 0
     index = 0
-    user_cap_events:list[Tuple[str, int]] = [] # [(rsn,timestamp)]
-    while index < len(clan_members):
+    activity_dict = {}
+    while index < len(users):
         if cancel_event.is_set():
-            return user_cap_events
+            return activity_dict
         
-        member = clan_members[index]
+        rsn = users[index]
         try:
-            time.sleep(3) # stay within 20 requests/minute
+            time.sleep(1)
 
-            log.debug(f"Fetching alog for {member.rsn}")
-            activities = fetch_user_activites(member.rsn)
-            activities = get_cap_events(activities)
-            for activity in activities:
-                timestamp = get_date_timestamp(activity.date)
-                user_cap_events.append((member.rsn, timestamp))
+            log.debug(f"Fetching alog for {rsn}")
+            activities = fetch_user_activites(rsn, num_activities)
+            activity_dict[rsn] = ActivityLog(private=False, activities=activities)
 
-            num_success += 1
-            if max_events > 0 and num_success >= max_events:
-                break
             index += 1
             request_delay = 10 # Reset as we had a success
 
         except PrivateProfileException:
-            log.warning(f"Failed to fetch activities for {member.rsn}: runemetrics profile is private")
+            log.warning(f"Failed to fetch activities for {rsn}: runemetrics profile is private")
+            activity_dict[rsn] = ActivityLog(private=True, activities=[])
             index += 1
 
         except HTTPError as http_error:
@@ -109,28 +102,98 @@ def get_clan_cap_events(clan_name:str, cancel_event:threading.Event, max_events:
             raise http_error # unhandled; fallback to below block
         
         except Exception as ex:
-            log.exception(f"Failed to fetch user activities for {member.rsn}: {ex}")
+            log.exception(f"Failed to fetch user activities for {rsn}: {ex}")
             num_failures += 1
             if num_failures > MAX_FAILURES:
                 log.error(f"Exceeded max failures for fetching user activites. Stopping further queries.")
-                return user_cap_events
+                return activity_dict
             index += 1 # skip this user
             continue
     
-    return user_cap_events
+    return activity_dict
 
 def fetch_cap_event_task(cancel_event:threading.Event):
     log = logging.getLogger(LOG_NAME)
     start_time = time.time()
     log.debug("Starting fetch_cap_event_task...")
 
-    cap_events = get_clan_cap_events(CLAN_NAME, cancel_event)
+    """
+    - only query a user's activity if their last activity was within 1 day OR we haven't queried them in > 1 day.
+    1. fetch all clan members from API
+    2. INSERT OR IGNORE all users into user_activity with 0,0 set for timestamps. This adds any missing members.
+    3. SELECT rsn from user_activity WHERE last_activity_timestamp < {now-1 day} OR last_query_timestamp > {now - 1day}
+    4. query activity data for these users.
+    5. UPDATE user_activity SET last_activity_timestamp={timestamp}, last_query_timestamp={now} WHERE ?
+    """
 
-    insert_rows = [(event[0], event[1], "auto") for event in cap_events]
-    log.debug(f"Attempting to insert rows: {insert_rows}")
+    # Fetch all clan members from rs api so we always have up to date list.
+    try:
+        log.info(f"Fetching clan members for {CLAN_NAME}")
+        clan_members:list[ClanMember] = fetch_clan_members(CLAN_NAME)
+    except Exception as ex:
+        log.exception(f"Failed to fetch clan members for {CLAN_NAME}: {ex}")
+        return
+
     with get_db() as dbcon:
+        # Insert any new rsns into the activity table. We default the timestamps to 0 to ensure they'll be queried in the next step.
+        rows = [(member.rsn,0,0) for member in clan_members]
+        cur = dbcon.executemany("INSERT OR IGNORE INTO user_activity(rsn, last_activity_timestamp, last_query_timestamp) VALUES(?,?,?)", rows)
+        log.debug(f"Added {cur.rowcount} new users into the user_activity table.")
+
+        # Get all users that have been active or we haven't checked recently.
+        recent_activity_timestamp = get_offset_from_now_timestamp(timedelta(hours=2))
+        stale_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=1))
+        cur = dbcon.execute(f"SELECT rsn FROM user_activity WHERE last_activity_timestamp >= {recent_activity_timestamp} OR last_query_timestamp < {stale_activity_timestamp}")
+        users_to_query = [row[0] for row in cur.fetchall()]
+
+    if len(users_to_query) == 0:
+        log.debug("No users to query.")
+        return
+
+    cap_events = []
+    latest_activities = []
+    private_profiles = set()
+
+    # Only query a few at a time as it's very slow due to Jagex rate limits
+    log.debug(f"{len(users_to_query)} total users to query.")
+    users_to_query = users_to_query[:15]
+
+    # Query the user alogs. 
+    user_activities:dict[str, ActivityLog] = get_user_activities(users_to_query, cancel_event)
+
+    for rsn, activity_log in user_activities.items():
+        if activity_log.private:
+            private_profiles.add(rsn)
+            continue
+
+        # Find any cap events
+        for activity in get_cap_events(activity_log.activities):
+            timestamp = get_date_timestamp(activity.date)
+            cap_events.append({"rsn": rsn, "cap_timestamp": timestamp})
+
+        # Get latest activity date, which is always the first activity in the list
+        if len(activity_log.activities) > 0:
+            timestamp = get_date_timestamp(activity_log.activities[0].date)
+            latest_activities.append({"rsn": rsn, "last_activity_timestamp": timestamp})
+
+    with get_db() as dbcon:
+        # Add new cap events
+        insert_rows = [(event["rsn"], event["cap_timestamp"], "auto") for event in cap_events]
+        log.debug(f"Attempting to insert rows: {insert_rows}")
         cur = dbcon.executemany("INSERT OR IGNORE INTO cap_events(rsn, cap_timestamp, source) VALUES(?,?,?)", insert_rows)
-        log.debug(f"Inserted {cur.rowcount} new rows.")
+        log.debug(f"Inserted {cur.rowcount} new rows into cap_events. Rows = {insert_rows}")
+
+        # Update user_activity table with last activities/query time.
+        # Hard-coding private to false since it can't be true if we have activities.
+        now = datetime.now(timezone.utc).timestamp()
+        user_activity_rows = [(event["last_activity_timestamp"], now, event["rsn"]) for event in latest_activities]
+        cur = dbcon.executemany("UPDATE user_activity SET last_activity_timestamp = ?, last_query_timestamp = ?, private = 0 WHERE rsn = ?", user_activity_rows)
+        log.debug(f"Updated last_activity_timestamp for {cur.rowcount} rows in user_activity. Rows = {user_activity_rows}")
+
+        # Update query time for users we queried but got no activity data from.
+        no_activity_rows = [(now, (1 if rsn in private_profiles else 0), rsn) for rsn in users_to_query if rsn not in user_activities or len(user_activities[rsn].activities) == 0]
+        cur = dbcon.executemany("UPDATE user_activity SET last_query_timestamp = ?, private = ? WHERE rsn = ?", no_activity_rows)
+        log.debug(f"Updated last_query_timestamp for {cur.rowcount} in-active users in user_activity. Rows = {no_activity_rows}")
 
     log.debug(f"fetch_cap_event_task completed after {time.time() - start_time} seconds.")
 
@@ -180,7 +243,7 @@ class DiscordClient(discord.Client):
                 self.logger.error("Timed out waiting for fetch_cap_event_task thread to join.")
         super().close()
 
-    @tasks.loop(minutes=15)
+    @tasks.loop(minutes=1)
     async def update_database_task(self):
         if self.task_thread and self.task_thread.is_alive():
             self.logger.error("fetch_cap_event_task thread is still alive. Skipping update")
@@ -231,9 +294,19 @@ async def caplist(interaction:discord.Interaction, days:int=7):
         message += ('-' * table_width) + "```"
     await interaction.response.send_message(message, ephemeral=True)
 
+@discord_client.tree.command(name="list-private-alogs", description="List any users that have their alog set to private")
+async def list_private_alogs(interaction:discord.Interaction):
+    with get_db() as db:
+        cur = db.execute("SELECT rsn FROM user_activity WHERE private=1")
+        results = cur.fetchall()
+        rsns = [f"- {row[0]}" for row in results]
+        message = "### Users with private Alogs:\n" + "\n".join(rsns)
+        await interaction.response.send_message(message, ephemeral=True)
+
 def run_bot():
     token = os.getenv("BOT_TOKEN")
     discord_client.run(token=token)
 
 if __name__ == "__main__":
+    CLAN_NAME = os.getenv("CAPBOT_CLAN_NAME")
     run_bot()

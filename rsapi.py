@@ -37,6 +37,11 @@ class Activity:
     details:str
     text:str
 
+@dataclass
+class ActivityLog:
+    private:bool
+    activities:list[Activity]
+
 class PrivateProfileException(Exception):
     pass
 
