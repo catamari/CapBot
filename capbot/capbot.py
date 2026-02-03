@@ -209,7 +209,7 @@ class DiscordClient(discord.Client):
             self.task_thread.join(timeout=30)
             if self.task_thread.is_alive():
                 self.logger.error("Timed out waiting for update_task thread to join.")
-        super().close()
+        await super().close()
 
     @tasks.loop(minutes=UPDATE_LOOP_MINUTES)
     async def update_database_task(self):
