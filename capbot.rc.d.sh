@@ -11,12 +11,11 @@ rcvar="${name}_enable"
 
 load_rc_config $name
 
-: ${capbot_enable="YES"}
-: ${capbot_user="jailuser"}
-: ${capbot_group="jailuser"}
-: ${capbot_cwd="/home/jailuser/CapBot"}
-: ${capbot_workdir="/home/jailuser/CapBot"}
-: ${capbot_env_file="/home/jailuser/CapBot/env_vars"}
+: ${capbot_enable:="YES"}
+: ${capbot_user:="jailuser"}
+: ${capbot_group:="jailuser"}
+: ${capbot_workdir:="/home/jailuser/CapBot"}
+: ${capbot_env_file:="/home/jailuser/CapBot/env_vars"}
 : ${capbot_command:="/usr/local/bin/python3.13"}
 : ${capbot_script:="/home/jailuser/CapBot/capbot/capbot.py"}
 : ${capbot_pidfile:="/tmp/capbot.pid"}
@@ -26,6 +25,7 @@ command="/usr/sbin/daemon"
 command_args="-f -p ${capbot_pidfile} -u ${capbot_user} \
     -o ${capbot_logfile} -m 3 \
     -c ${capbot_workdir} \
+    -p ${capbot_pidfile} \
     ${capbot_command} ${capbot_script}"
 
 start_precmd="${name}_prestart"
