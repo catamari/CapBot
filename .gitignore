@@ -5,3 +5,4 @@ Lib/
 *.db
 *.pyc
 pyvenv.cfg
+.vscode/
