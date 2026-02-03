@@ -15,8 +15,8 @@ from rsapi import *
 LOG_NAME = "CapBot"
 CLAN_NAME = "Unknown"
 MAX_FAILURES = 5
-MAX_USER_QUERIES = 20
-UPDATE_LOOP_MINUTES = 1
+MAX_USER_QUERIES = 15
+UPDATE_LOOP_MINUTES = 2
 
 def get_date_timestamp(date:str) -> float:
     """ Parses the date from a date string (RS Alog format) and returns it as a timestamp. """
@@ -182,25 +182,6 @@ def update_task(cancel_event:threading.Event):
 
     log.debug(f"update_task completed after {time.time() - start_time} seconds.")
 
-def init_log():
-    log = logging.getLogger(LOG_NAME)
-    log.setLevel(logging.DEBUG)
-    formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s")
-
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    log.addHandler(console_handler)
-
-    file_handler = logging.FileHandler("capbot.log", "w")
-    file_handler.setFormatter(formatter)
-    log.addHandler(file_handler)
-
-    log.info("CapBot log opened.")
-    return log
-
-init_log()
-init_db()
-
 class DiscordClient(discord.Client):
     def __init__(self, intents:discord.Intents):
         super().__init__(intents=intents)
@@ -291,9 +272,13 @@ async def list_private_alogs(interaction:discord.Interaction):
         await interaction.response.send_message(message, ephemeral=True)
 
 def run_bot():
-    token = os.getenv("BOT_TOKEN")
+    global CLAN_NAME
+    CLAN_NAME = os.getenv("CAPBOT_CLAN_NAME")
+
+    init_db()
+
+    token = os.getenv("CAPBOT_TOKEN")
     discord_client.run(token=token)
 
 if __name__ == "__main__":
-    CLAN_NAME = os.getenv("CAPBOT_CLAN_NAME")
     run_bot()
