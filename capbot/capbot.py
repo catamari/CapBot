@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import threading
+import tempfile
 from datetime import datetime, timezone, timedelta
 from requests import HTTPError
 
@@ -233,6 +234,30 @@ class DiscordClient(discord.Client):
 intents = discord.Intents.default()
 discord_client = DiscordClient(intents)
 
+def create_table(column_names:list[str], rows:list[list[str]], newline:str='\n'):
+    # Find longest strings in each column so we can pad out the rest to match.
+    column_widths:list[int] = [0] * len(column_names)
+    for row in rows + [column_names]:
+        for i in range(len(column_names)):
+            column_widths[i] = max(column_widths[i], len(row[i]))
+
+    # Compute table size
+    vertical_bars = len(column_names) + 1
+    padding = len(column_names) * 2
+    table_width = sum(column_widths) + vertical_bars + padding
+
+    def horizontal_line():
+        return ('-' * table_width) + newline
+    
+    table = horizontal_line()
+    table += "|" + "|".join([f" {column_names[i]:<{column_widths[i]}} " for i in range(len(column_widths))]) + "|" + newline
+    table += horizontal_line()
+
+    for row in rows:
+        table += "|" + "|".join([f" {row[i]:<{column_widths[i]}} " for i in range(len(column_widths))]) + "|" + newline
+    table += horizontal_line()
+    return table
+
 @discord_client.tree.command(name="caplist", description="Get the list of users that have capped in the last N days.")
 async def caplist(interaction:discord.Interaction, days:int=7):
     now = datetime.now(timezone.utc)
@@ -243,28 +268,10 @@ async def caplist(interaction:discord.Interaction, days:int=7):
         rows = [(row[0], row[1]) for row in con.fetchall()]
         rows.sort(key=lambda pair: pair[1], reverse=True) # sort by date
 
-        # Find longest strings in each column so we can pad out the rest to match.
-        longest_name = 0
-        longest_date = 0
-        for rsn, timestamp in rows:
-            longest_name = max(longest_name, len(rsn))
-            longest_date = max(longest_date, len(timestamp_to_date(timestamp)))
-
-        # Compute table size
-        column_headers = ["RSN", "Cap Date"]
-        vertical_bars = len(column_headers) + 1
-        padding = len(column_headers) * 2
-        table_width = longest_name + longest_date + vertical_bars + padding
-
-        message = f"### Users that have capped in the last {days} days:\n"
-        message += "```\n" + ('-' * table_width) + "\n" # start code block + first horizontal bar
-
-        # Add table rows
-        for rsn, timestamp in rows:
-            date = timestamp_to_date(timestamp)
-            message += f"| {rsn:<{longest_name}} | {date:<{longest_date}} |\n"
-        # Bottom vrtical bar + close code block
-        message += ('-' * table_width) + "```"
+        column_headers = ["RSN", "Cap Date (Game Time)"]
+        rows = [[rsn, timestamp_to_date(cap_timestamp)] for rsn, cap_timestamp in rows]
+        message = f"### Users that Capped in the last {days} days\n"
+        message += f"```\n{create_table(column_headers, rows)}```"
     await interaction.response.send_message(message, ephemeral=True)
 
 @discord_client.tree.command(name="list-private-alogs", description="List any users that have their alog set to private")
@@ -278,8 +285,8 @@ async def list_private_alogs(interaction:discord.Interaction):
             message += "None"
         await interaction.response.send_message(message, ephemeral=True)
 
-@discord_client.tree.command(name="user-status", description="Print cap/scan information about a user.")
-async def scan_status(interaction:discord.Interaction, rsn:str):
+@discord_client.tree.command(name="user-status", description="Print cap/scan information about a user. If no user is specified it will dump info for all users.")
+async def user_status(interaction:discord.Interaction, rsn:str=None):
     with get_db() as db:
         if rsn is not None:
             cur = db.execute("""
@@ -302,11 +309,52 @@ async def scan_status(interaction:discord.Interaction, rsn:str):
                 message = f"### User Status For {rsn}:\n"
                 message += f"Last Activity Time: {format_timestamp_for_discord(int(result[0]))}\n"
                 message += f"Last Scan Time: {format_timestamp_for_discord(int(result[1]))}\n"
-                message += f"Last Cap Time: {format_timestamp_for_discord(int(result[3])) if result[3] else None}\n"
+                message += f"Last Cap Time: {format_timestamp_for_discord(int(result[3])) if result[3] else "Unknown"}\n"
                 message += f"Private ALog?: {'Yes' if result[2] == 1 else '`No`'}\n"
                 await interaction.response.send_message(message, ephemeral=True)
             else:
                 await interaction.response.send_message(f"No matching rsn found.", ephemeral=True)
+        
+        else: # all users
+            cur = db.execute("""
+                SELECT
+                    ua.rsn,
+                    ua.last_activity_timestamp,
+                    ua.last_query_timestamp,
+                    ua.private,
+                    (
+                        SELECT ce.cap_timestamp
+                        FROM cap_events ce
+                        WHERE ce.rsn = ua.rsn COLLATE NOCASE
+                        ORDER BY ce.cap_timestamp DESC
+                        LIMIT 1
+                    ) AS cap_timestamp
+                FROM user_activity ua
+                ORDER BY ua.last_query_timestamp DESC
+                """)
+            results = cur.fetchall()
+            if not results:
+                await interaction.response.send_message("No records found.", ephemeral=True)
+                return
+
+            formatted_rows = [
+                [
+                    user_rsn,
+                    timestamp_to_date(int(last_activity)),
+                    timestamp_to_date(int(last_query)),
+                    timestamp_to_date(int(last_cap)) if last_cap else "Unknown",
+                    "Yes" if is_private == 1 else "No"
+                ]
+                for user_rsn, last_activity, last_query, is_private, last_cap in results
+            ]
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+                temp_filename = f.name
+                table = create_table(["Rsn", "Last Activity Date", "Last Scan Date", "Last Cap Date", "Private ALog"], formatted_rows)
+                f.write(table)
+            try:
+                await interaction.response.send_message("Full user status summary:", file=discord.File(temp_filename))
+            finally:
+                os.remove(temp_filename)
 
 
 def run_bot():
