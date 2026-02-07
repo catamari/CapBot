@@ -7,52 +7,32 @@
 . /etc/rc.subr
 
 name="capbot"
-rcvar="${name}_enable"
+rcvar=${name}_enable
 
-: ${capbot_enable:="YES"}
-: ${capbot_user:="jailuser"}
-: ${capbot_group:="jailuser"}
-#: ${capbot_workdir:="/home/jailuser/CapBot"}
-: ${capbot_env_file:="/home/jailuser/CapBot/env_vars"}
-: ${capbot_command:="/usr/local/bin/python3.13"}
-: ${capbot_script:="/home/jailuser/CapBot/capbot/capbot.py"}
-: ${capbot_pidfile:="/var/run/capbot/capbot.pid"}
-: ${capbot_logfile:="/var/log/capbot/capbot.log"}
+load_rc_config $name
 
-# Force wd to avoid duplicate issue
-capbot_workdir="/home/jailuser/CapBot"
+: ${capbot_enable="YES"}
+: ${capbot_args=""}
+: ${capbot_user="jailuser"}
+: ${capbot_cwd="/home/jailuser/CapBot"}
+: ${capbot_workdir="/home/jailuser/CapBot"}
+: ${capbot_env_file="/home/jailuser/CapBot/env_vars"}
 
-command="/usr/sbin/daemon"
-command_args="-u ${capbot_user} \
-    -o ${capbot_logfile} -m 3 \
-    -c ${capbot_workdir} \
-    -p ${capbot_pidfile} \
-    ${capbot_command} ${capbot_script}"
+# This must match the path in CapBot/env_vars
+pidfile="/var/run/${name}/${name}.pid"
+# This is a script that runs git pull then starts run.py
+command="/home/jailuser/CapBot/runbot"
+# We need this for 'status' to work correctly as it doesn't know what the process type is otherwise since we're not running python directly.
+procname="/usr/local/bin/python3.13"
+capbot_user="jailuser"
+capbot_chdir="/home/jailuser/CapBot"
 
 start_precmd="${name}_prestart"
-stop_cmd="${name}_stop"
 
 capbot_prestart()
 {
-    install -d -o ${capbot_user} -g ${capbot_group} ${capbot_workdir}
-    install -d -o ${capbot_user} -g ${capbot_group} /var/run/capbot
-    install -d -o ${capbot_user} -g ${capbot_group} /var/log/capbot
-    touch ${capbot_logfile}
-    chown ${capbot_user}:${capbot_group} ${capbot_logfile}
-
-    # Always update code before starting
-    echo "prestart: workdir=${capbot_workdir}" >> "${capbot_logfile}"
-    su -m "${capbot_user}" -c "cd '${capbot_workdir}' && /bin/pwd && /usr/local/bin/git rev-parse --is-inside-work-tree && /usr/local/bin/git pull" \
-    >> "${capbot_logfile}" 2>&1 || echo "WARNING: git pull failed" >> "${capbot_logfile}"
-    return 0
+    # NOTE: capbot/run.py needs to write to this path!
+    install -d -o jailuser /var/run/capbot/
 }
 
-capbot_stop()
-{
-    if [ -f "${capbot_pidfile}" ]; then
-        kill "$(cat ${capbot_pidfile})" 2>/dev/null || true
-    fi
-}
-
-load_rc_config $name
 run_rc_command "$1"
