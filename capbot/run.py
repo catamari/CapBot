@@ -12,7 +12,8 @@ def start_linux(log):
 
     context = daemon.DaemonContext(
         working_directory=os.getenv("CAPBOT_CWD"),
-        pidfile=daemon.pidfile.PIDLockFile(os.getenv("CAPBOT_PIDFILE"))
+        pidfile=daemon.pidfile.PIDLockFile(os.getenv("CAPBOT_PIDFILE")),
+        files_preserve="capbot.log" # The daemon context closes an open files, so keep the log open.
     )
 
     with context:
