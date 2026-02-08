@@ -123,17 +123,9 @@ def update_task(cancel_event:threading.Event):
         cur = dbcon.executemany("INSERT OR IGNORE INTO user_activity(rsn, last_activity_timestamp, last_query_timestamp) VALUES(?,?,?)", rows)
         log.debug(f"Added {cur.rowcount} new users into the user_activity table.")
 
-        # Get all users that have been active in the last week, or we haven't checked recently. Prioritize stale queries to ensure active users don't hog the queue.
-        recently_checked_timestamp = get_offset_from_now_timestamp(timedelta(minutes=10)) 
-        recent_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=7))
-        stale_activity_timestamp = get_offset_from_now_timestamp(timedelta(days=1))
-        cur = dbcon.execute(f"""
-            SELECT rsn 
-            FROM user_activity 
-            WHERE 
-                (private = 0 AND last_activity_timestamp < {recent_activity_timestamp} AND last_query_timestamp < {recently_checked_timestamp})
-                OR last_query_timestamp < {stale_activity_timestamp} 
-            ORDER BY last_query_timestamp ASC""")
+        # Get all users that have been active in the last week, or we haven't checked recently.
+        # Only query a few at a time as it's very slow due to Jagex rate limits.
+        cur = dbcon.execute(f"SELECT rsn FROM user_activity ORDER BY last_query_timestamp ASC LIMIT {users_to_query}")
         users_to_query = [row[0] for row in cur.fetchall()]
 
     if len(users_to_query) == 0:
@@ -143,10 +135,6 @@ def update_task(cancel_event:threading.Event):
     cap_events = []
     latest_activities = []
     private_profiles = set()
-
-    # Only query a few at a time as it's very slow due to Jagex rate limits
-    log.debug(f"{len(users_to_query)} total users to query.")
-    users_to_query = users_to_query[:MAX_USER_QUERIES]
 
     # Query the user alogs. 
     user_activities:dict[str, ActivityLog] = get_user_activities(users_to_query, cancel_event)
