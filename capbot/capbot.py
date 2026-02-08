@@ -192,10 +192,10 @@ class DiscordClient(discord.Client):
         self.logger.debug(f'Logged on as {self.user}!')
         if not os.getenv("CAPBOT_DISABLE_SCAN_TASK", False):
             # Kick off the update task. We could do this earlier but this way we don't have to wait on it if login fails.
-            logging.debug("Starting update_database_task.")
+            self.logger.debug("Starting update_database_task.")
             self.update_database_task.start()
         else:
-            logging.info("Not starting update_database_task due to 'CAPBOT_DISABLE_SCAN_TASK' being set.")
+            self.logger.info("Not starting update_database_task due to 'CAPBOT_DISABLE_SCAN_TASK' being set.")
 
     async def close(self):
         # Kill the update thread before shutting down.

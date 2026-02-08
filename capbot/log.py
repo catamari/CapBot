@@ -1,4 +1,5 @@
 import logging
+from logging.handlers import RotatingFileHandler
 
 LOG_NAME = "CapBot"
 
@@ -12,7 +13,7 @@ def init_log(mode="w"):
     console_handler.setLevel(logging.DEBUG)
     log.addHandler(console_handler)
 
-    file_handler = logging.FileHandler("capbot.log", encoding="utf-8", mode=mode)
+    file_handler = RotatingFileHandler("capbot.log", encoding="utf-8", mode=mode, maxBytes=1024*1024*10, backupCount=3)
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG)
     log.addHandler(file_handler)
