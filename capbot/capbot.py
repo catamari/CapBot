@@ -227,7 +227,7 @@ def create_table(column_names:list[str], rows:list[list[str]], newline:str='\n')
     column_widths:list[int] = [0] * len(column_names)
     for row in rows + [column_names]:
         for i in range(len(column_names)):
-            column_widths[i] = max(column_widths[i], len(row[i]))
+            column_widths[i] = max(column_widths[i], len(str(row[i])))
 
     # Compute table size
     vertical_bars = len(column_names) + 1
@@ -261,6 +261,37 @@ async def caplist(interaction:discord.Interaction, days:int=7):
         message = f"### Users that Capped in the last {days} days\n"
         message += f"```\n{create_table(column_headers, rows)}```"
     await interaction.response.send_message(message, ephemeral=True)
+
+@discord_client.tree.command(name="captotal", description="Lists the total number of times each member has capped.")
+async def captotal(interaction:discord.Interaction, days:int=0):
+    now = datetime.now(timezone.utc)
+    start_date = now - timedelta(days=days) if days > 0 else datetime(year=1995, month=1, day=1)
+    timestamp = int(start_date.timestamp()) # Truncate as we only care about seconds
+    with get_db() as db:
+        con = db.execute(f"""
+            SELECT 
+                rsn,
+                COUNT(rsn) as cap_count 
+            FROM cap_events 
+            WHERE cap_timestamp >= {timestamp}
+            GROUP BY rsn
+            ORDER BY cap_count DESC""")
+        rows = [(row[0], row[1]) for row in con.fetchall()]
+
+        column_headers = ["RSN", "Total Citadel Caps"]
+        rows = [[rsn, cap_count] for rsn, cap_count in rows]
+        message = f"### Total Citadel Caps per user"
+        message += f" in the last {days} days"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            temp_filename = f.name
+            table = create_table(column_headers, rows)
+            f.write(table)
+            f.close()
+            try:
+                await interaction.response.send_message(message, file=discord.File(temp_filename), ephemeral=True)
+            finally:
+                os.remove(temp_filename)
 
 @discord_client.tree.command(name="list-private-alogs", description="List any users that have their alog set to private")
 async def list_private_alogs(interaction:discord.Interaction):
